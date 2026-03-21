@@ -1,0 +1,236 @@
+#!/usr/bin/env node
+import { Command } from "commander";
+import chalk from "chalk";
+import ora from "ora";
+import { existsSync, readdirSync, statSync, writeFileSync } from "fs";
+import { homedir, platform } from "os";
+import { join, resolve } from "path";
+import { parseLinkedInCsv } from "./parse.js";
+import { syncToClay } from "./clay.js";
+import { loadConfig, saveConfig } from "./config.js";
+
+const program = new Command();
+
+program
+  .name("linkedin-clay-sync")
+  .description("Sync LinkedIn connections to Clay — no LinkedIn API required")
+  .version("1.0.0");
+
+// ── sync command ───────────────────────────────────────────────────────────────
+
+program
+  .command("sync")
+  .description("Import LinkedIn connections CSV → Clay webhook")
+  .argument("[csv]", "Path to Connections.csv (auto-detects from Downloads if omitted)")
+  .option("-w, --webhook <url>", "Clay webhook URL (or set CLAY_WEBHOOK_URL env var)")
+  .option("--all", "Re-sync all connections, not just new ones")
+  .option("--dry-run", "Parse and count without sending to Clay")
+  .action(async (csvArg, opts) => {
+    const config = loadConfig();
+
+    // Resolve CSV path
+    let csvPath: string;
+    if (csvArg) {
+      csvPath = resolve(csvArg);
+    } else {
+      csvPath = findLatestLinkedInCsv();
+    }
+
+    if (!existsSync(csvPath)) {
+      console.error(chalk.red(`CSV not found: ${csvPath}`));
+      console.error(
+        chalk.dim(
+          "Export from: linkedin.com → Settings → Data Privacy → Get a copy of your data → Connections"
+        )
+      );
+      process.exit(1);
+    }
+
+    const webhookUrl = opts.webhook ?? config.clayWebhookUrl ?? process.env.CLAY_WEBHOOK_URL;
+    if (!webhookUrl && !opts.dryRun) {
+      console.error(chalk.red("No Clay webhook URL provided."));
+      console.error(chalk.dim("Pass --webhook <url> or set CLAY_WEBHOOK_URL"));
+      process.exit(1);
+    }
+
+    const spinner = ora("Parsing connections CSV...").start();
+    let connections;
+    try {
+      connections = await parseLinkedInCsv(csvPath);
+      spinner.succeed(`Parsed ${chalk.bold(connections.length)} connections`);
+    } catch (err) {
+      spinner.fail("Failed to parse CSV");
+      console.error(err);
+      process.exit(1);
+    }
+
+    if (opts.dryRun) {
+      console.log(chalk.yellow("Dry run — not sending to Clay"));
+      const newCount = connections.filter(
+        (c) => !config.syncedIds.includes(c.submissionId)
+      ).length;
+      console.log(`  ${newCount} new connections would be sent`);
+      console.log(`  ${connections.length - newCount} already synced`);
+      return;
+    }
+
+    const alreadySynced = opts.all
+      ? new Set<string>()
+      : new Set(config.syncedIds);
+
+    const toSync = connections.filter((c) => !alreadySynced.has(c.submissionId));
+    if (toSync.length === 0) {
+      console.log(chalk.green("✓ All connections already synced — nothing new to send"));
+      return;
+    }
+
+    console.log(
+      chalk.cyan(`\nSending ${toSync.length} new connections to Clay...\n`)
+    );
+
+    let i = 0;
+    const result = await syncToClay(
+      toSync,
+      webhookUrl,
+      alreadySynced,
+      (name, status) => {
+        i++;
+        const icon =
+          status === "sent" ? chalk.green("✓") : status === "skipped" ? chalk.dim("–") : chalk.red("✗");
+        process.stdout.write(`\r${icon} [${i}/${toSync.length}] ${name.padEnd(40)}`);
+      }
+    );
+
+    process.stdout.write("\n\n");
+    console.log(chalk.green(`✓ Sent: ${result.sent}`));
+    if (result.failed.length > 0) {
+      console.log(chalk.red(`✗ Failed: ${result.failed.length}`));
+    }
+
+    // Save state
+    config.syncedIds = [...alreadySynced];
+    config.lastSyncedAt = new Date().toISOString();
+    if (webhookUrl) config.clayWebhookUrl = webhookUrl;
+    saveConfig(config);
+
+    console.log(chalk.dim(`\nState saved → ${homedir()}/.linkedin-clay-sync.json`));
+  });
+
+// ── install-cron command ───────────────────────────────────────────────────────
+
+program
+  .command("install-cron")
+  .description("Install a daily LaunchAgent (macOS) to auto-sync new connections")
+  .option("-w, --webhook <url>", "Clay webhook URL")
+  .option("--hour <h>", "Hour to run (0-23, default 8)", "8")
+  .action(async (opts) => {
+    if (platform() !== "darwin") {
+      console.error(chalk.red("install-cron only supports macOS (LaunchAgent)"));
+      process.exit(1);
+    }
+
+    const config = loadConfig();
+    const webhookUrl = opts.webhook ?? config.clayWebhookUrl ?? process.env.CLAY_WEBHOOK_URL;
+    if (!webhookUrl) {
+      console.error(chalk.red("No webhook URL — pass --webhook <url>"));
+      process.exit(1);
+    }
+
+    config.clayWebhookUrl = webhookUrl;
+    saveConfig(config);
+
+    const scriptPath = resolve(import.meta.dirname, "../scripts/daily-sync.sh");
+    const plistPath = join(
+      homedir(),
+      "Library/LaunchAgents/com.calebnewton.linkedin-clay-sync.plist"
+    );
+
+    const scriptContent = `#!/bin/bash
+# Auto-generated by linkedin-clay-sync
+# Finds the latest LinkedIn Connections.csv and syncs new connections to Clay
+
+DOWNLOADS="$HOME/Downloads"
+CSV=$(find "$DOWNLOADS" -name "Connections.csv" -not -path "*/\\.*" 2>/dev/null | sort -t_ -k1,1 | tail -1)
+
+if [ -z "$CSV" ]; then
+  echo "$(date): No Connections.csv found in Downloads" >> /tmp/linkedin-clay-sync.log
+  exit 0
+fi
+
+echo "$(date): Syncing from $CSV" >> /tmp/linkedin-clay-sync.log
+node "$(dirname "$0")/../src/cli.ts" sync "$CSV" --webhook "${webhookUrl}" >> /tmp/linkedin-clay-sync.log 2>&1
+`;
+
+    const plistContent = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.calebnewton.linkedin-clay-sync</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/env</string>
+    <string>npx</string>
+    <string>tsx</string>
+    <string>${resolve(process.cwd(), "src/cli.ts")}</string>
+    <string>sync</string>
+    <string>--webhook</string>
+    <string>${webhookUrl}</string>
+  </array>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>${opts.hour}</integer>
+    <key>Minute</key>
+    <integer>0</integer>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>/tmp/linkedin-clay-sync.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/linkedin-clay-sync-error.log</string>
+  <key>WorkingDirectory</key>
+  <string>${resolve(process.cwd())}</string>
+</dict>
+</plist>`;
+
+    writeFileSync(scriptPath, scriptContent, { mode: 0o755 });
+    writeFileSync(plistPath, plistContent);
+
+    console.log(chalk.green("✓ LaunchAgent installed"));
+    console.log(chalk.dim(`  Plist: ${plistPath}`));
+    console.log(chalk.dim(`  Runs daily at ${opts.hour}:00`));
+    console.log(chalk.dim(`  Logs: /tmp/linkedin-clay-sync.log`));
+    console.log("");
+    console.log(chalk.cyan("To activate:"));
+    console.log(`  launchctl load ${plistPath}`);
+    console.log("");
+    console.log(chalk.dim("Each morning it will check Downloads for a fresh"));
+    console.log(chalk.dim("Connections.csv and push only new connections to Clay."));
+  });
+
+// ── auto-detect CSV ────────────────────────────────────────────────────────────
+
+function findLatestLinkedInCsv(): string {
+  const downloads = join(homedir(), "Downloads");
+  let best = { path: "", mtime: 0 };
+
+  function walk(dir: string) {
+    try {
+      for (const entry of readdirSync(dir)) {
+        if (entry.startsWith(".")) continue;
+        const full = join(dir, entry);
+        const stat = statSync(full);
+        if (stat.isDirectory()) {
+          walk(full);
+        } else if (entry === "Connections.csv" && stat.mtimeMs > best.mtime) {
+          best = { path: full, mtime: stat.mtimeMs };
+        }
+      }
+    } catch {}
+  }
+
+  walk(downloads);
+  return best.path || join(downloads, "Connections.csv");
+}
+
+program.parse();

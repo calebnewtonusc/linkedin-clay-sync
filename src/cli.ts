@@ -8,6 +8,7 @@ import { join, resolve } from "path";
 import { parseLinkedInCsv } from "./parse.js";
 import { syncToClay } from "./clay.js";
 import { loadConfig, saveConfig } from "./config.js";
+import { scrapeConnections } from "./scraper.js";
 
 const program = new Command();
 
@@ -114,6 +115,74 @@ program
     saveConfig(config);
 
     console.log(chalk.dim(`\nState saved → ${homedir()}/.linkedin-clay-sync.json`));
+  });
+
+// ── scrape command ─────────────────────────────────────────────────────────────
+
+program
+  .command("scrape")
+  .description("Scrape LinkedIn connections directly via browser — no CSV export needed")
+  .option("-w, --webhook <url>", "Clay webhook URL (or set CLAY_WEBHOOK_URL env var)")
+  .option("--headless", "Run browser in headless mode (requires saved session)")
+  .option("--dry-run", "Scrape without sending to Clay")
+  .action(async (opts) => {
+    const config = loadConfig();
+    const webhookUrl = opts.webhook ?? config.clayWebhookUrl ?? process.env.CLAY_WEBHOOK_URL;
+
+    if (!webhookUrl && !opts.dryRun) {
+      console.error(chalk.red("No Clay webhook URL. Pass --webhook <url> or set CLAY_WEBHOOK_URL"));
+      process.exit(1);
+    }
+
+    console.log(chalk.cyan("\nOpening LinkedIn in browser..."));
+    console.log(chalk.dim("If you see a login page, sign in — the session will be saved for future runs.\n"));
+
+    const alreadySynced = new Set(config.syncedIds);
+    const scraped: Array<import("./scraper.js").ScrapedConnection> = [];
+    let sent = 0;
+    let failed = 0;
+
+    const connections = await scrapeConnections({
+      headless: opts.headless ?? false,
+      onProgress: (count, conn) => {
+        process.stdout.write(`\r${chalk.dim("Scraping...")} ${chalk.bold(count)} connections found — ${conn.name.padEnd(35)}`);
+      },
+    });
+
+    process.stdout.write("\n");
+    console.log(chalk.green(`\n✓ Scraped ${connections.length} connections`));
+
+    if (opts.dryRun) {
+      const newCount = connections.filter((c) => !alreadySynced.has(c.submissionId)).length;
+      console.log(chalk.yellow(`Dry run — ${newCount} new connections would be sent to Clay`));
+      return;
+    }
+
+    const toSync = connections.filter((c) => !alreadySynced.has(c.submissionId));
+    console.log(chalk.cyan(`Sending ${toSync.length} new connections to Clay...\n`));
+
+    let i = 0;
+    const result = await syncToClay(
+      toSync,
+      webhookUrl!,
+      alreadySynced,
+      (name, status) => {
+        i++;
+        const icon = status === "sent" ? chalk.green("✓") : chalk.red("✗");
+        process.stdout.write(`\r${icon} [${i}/${toSync.length}] ${name.padEnd(40)}`);
+      }
+    );
+
+    process.stdout.write("\n\n");
+    console.log(chalk.green(`✓ Sent: ${result.sent}`));
+    if (result.failed.length > 0) console.log(chalk.red(`✗ Failed: ${result.failed.length}`));
+
+    config.syncedIds = [...alreadySynced];
+    config.lastSyncedAt = new Date().toISOString();
+    if (webhookUrl) config.clayWebhookUrl = webhookUrl;
+    saveConfig(config);
+
+    console.log(chalk.dim(`\nState saved — ${toSync.length - result.failed.length} new connections in Clay`));
   });
 
 // ── install-cron command ───────────────────────────────────────────────────────

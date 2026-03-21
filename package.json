@@ -9,6 +9,7 @@
   "scripts": {
     "scrape": "npx tsx src/cli.ts scrape",
     "sync": "npx tsx src/cli.ts sync",
+    "dedup": "npx tsx src/cli.ts dedup",
     "install-cron": "npx tsx src/cli.ts install-cron",
     "dev": "npx tsx src/cli.ts"
   },

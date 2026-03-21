@@ -1,14 +1,27 @@
 #!/usr/bin/env node
+
+// Load .env automatically if present
+import { existsSync, readFileSync } from "fs";
+import { resolve } from "path";
+const envPath = resolve(process.cwd(), ".env");
+if (existsSync(envPath)) {
+  for (const line of readFileSync(envPath, "utf-8").split("\n")) {
+    const match = line.match(/^([^#=]+)=(.*)$/);
+    if (match) process.env[match[1].trim()] ??= match[2].trim();
+  }
+}
+
 import { Command } from "commander";
 import chalk from "chalk";
 import ora from "ora";
-import { existsSync, readdirSync, statSync, writeFileSync } from "fs";
+import { readdirSync, statSync, writeFileSync } from "fs";
 import { homedir, platform } from "os";
-import { join, resolve } from "path";
+import { join } from "path";
 import { parseLinkedInCsv } from "./parse.js";
 import { syncToClay } from "./clay.js";
 import { loadConfig, saveConfig } from "./config.js";
 import { scrapeConnections } from "./scraper.js";
+import { scrapeViaAppleScript } from "./scraper-applescript.js";
 
 const program = new Command();
 
@@ -121,33 +134,42 @@ program
 
 program
   .command("scrape")
-  .description("Scrape LinkedIn connections directly via browser — no CSV export needed")
+  .description("Scrape LinkedIn connections directly — uses your existing Chrome on macOS, Playwright elsewhere")
   .option("-w, --webhook <url>", "Clay webhook URL (or set CLAY_WEBHOOK_URL env var)")
-  .option("--headless", "Run browser in headless mode (requires saved session)")
+  .option("--playwright", "Force Playwright browser instead of existing Chrome (non-macOS default)")
   .option("--dry-run", "Scrape without sending to Clay")
   .action(async (opts) => {
     const config = loadConfig();
     const webhookUrl = opts.webhook ?? config.clayWebhookUrl ?? process.env.CLAY_WEBHOOK_URL;
 
     if (!webhookUrl && !opts.dryRun) {
-      console.error(chalk.red("No Clay webhook URL. Pass --webhook <url> or set CLAY_WEBHOOK_URL"));
+      console.error(chalk.red("No Clay webhook URL."));
+      console.error(chalk.dim("Pass --webhook <url>, set CLAY_WEBHOOK_URL env var, or add it to .env"));
       process.exit(1);
     }
 
-    console.log(chalk.cyan("\nOpening LinkedIn in browser..."));
-    console.log(chalk.dim("If you see a login page, sign in — the session will be saved for future runs.\n"));
-
     const alreadySynced = new Set(config.syncedIds);
-    const scraped: Array<import("./scraper.js").ScrapedConnection> = [];
-    let sent = 0;
-    let failed = 0;
+    let connections: Awaited<ReturnType<typeof scrapeConnections>>;
 
-    const connections = await scrapeConnections({
-      headless: opts.headless ?? false,
-      onProgress: (count, conn) => {
-        process.stdout.write(`\r${chalk.dim("Scraping...")} ${chalk.bold(count)} connections found — ${conn.name.padEnd(35)}`);
-      },
-    });
+    const useMac = platform() === "darwin" && !opts.playwright;
+
+    if (useMac) {
+      console.log(chalk.cyan("\nConnecting to your existing Chrome session..."));
+      console.log(chalk.dim("Make sure linkedin.com/mynetwork/invite-connect/connections/ is open in Chrome.\n"));
+      connections = await scrapeViaAppleScript({
+        onProgress: (scraped, _pushed, name) => {
+          process.stdout.write(`\r${chalk.dim("Scraping...")} ${chalk.bold(scraped)} — ${name.padEnd(40)}`);
+        },
+      });
+    } else {
+      console.log(chalk.cyan("\nOpening LinkedIn in browser..."));
+      console.log(chalk.dim("Sign in if prompted — session is saved for future runs.\n"));
+      connections = await scrapeConnections({
+        onProgress: (count, name) => {
+          process.stdout.write(`\r${chalk.dim("Scraping...")} ${chalk.bold(count)} — ${name.padEnd(40)}`);
+        },
+      });
+    }
 
     process.stdout.write("\n");
     console.log(chalk.green(`\n✓ Scraped ${connections.length} connections`));

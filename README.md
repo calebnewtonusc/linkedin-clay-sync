@@ -136,3 +136,5 @@ LinkedIn has no public connections API. This tool:
 ## License
 
 MIT — build on it, fork it, use it for anything.
+
+All glory to God! ✝️❤️
